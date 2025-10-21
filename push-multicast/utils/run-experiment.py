@@ -1,3 +1,485 @@
+// Required for setting CPU affinity - MUST BE THE FIRST LINE
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <x86intrin.h>
+#include <sched.h>
+
+// --- Configuration ---
+#define SHARED_MEM_SIZE 4096    // Size of the shared memory region
+#define FLAG_MEM_SIZE 4096      // Size of the synchronization flag region
+#define MAX_MSG_SIZE 256        // Maximum message size
+#define SECRET_MESSAGE "This is a secret message!" // The message to be sent
+
+// Helper macro for histogram calibration
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+
+// --- gem5-Friendly Synchronization ---
+// Spin-wait (busy-loop) to create delays in gem5 instead of usleep/sched_yield
+void spin_wait(volatile long count) {
+    for (volatile long i = 0; i < count; i++);
+}
+
+// --- Cache Utility Functions ---
+
+// Accesses a memory address using inline assembly.
+static inline void maccess(void* p) {
+    asm volatile ("movq (%0), %%rax\n"
+        :
+        : "c" (p)
+        : "rax");
+}
+
+// *** MODIFICATION: Flushes a cache line using inline assembly. ***
+static inline void flush(void* p) {
+    asm volatile ("clflush 0(%0)\n"
+        :
+        : "c" (p)
+        : "rax");
+}
+
+// Measures the time taken to access a memory address using rdtscp.
+static inline uint64_t measure_access_time(void* addr) {
+    uint64_t start, end;
+    unsigned int junk; // To hold the CPU ID from rdtscp
+
+    _mm_mfence(); // Ensure memory operations complete before timing
+    start = __rdtscp(&junk);
+    maccess(addr);
+    _mm_mfence(); // Ensure maccess completes before timing
+    end = __rdtscp(&junk);
+
+    return end - start;
+}
+
+// --- Shared Data Structure ---
+typedef struct {
+    volatile char* shared_data;     // For data transmission
+    volatile char* sync_flags;      // For synchronization
+    pthread_barrier_t barrier;
+    unsigned int threshold;
+} channel_t;
+
+// --- Receiver (Spy) Thread ---
+
+// Calibrates the cache hit/miss threshold using a histogram method.
+unsigned int calibrate_threshold(void* mem) {
+    printf("[Calibrating] Determining cache hit/miss threshold using histograms...\n");
+    int sample_size = 200; // Number of bins in the histogram
+    size_t hit_histogram[sample_size];
+    size_t miss_histogram[sample_size];
+    memset(hit_histogram, 0, sizeof(hit_histogram));
+    memset(miss_histogram, 0, sizeof(miss_histogram));
+
+    // 1. Measure cache hit latencies
+    maccess(mem); // Bring into cache
+    for (int i = 0; i < 4*1024*128; i++) {
+        size_t d = measure_access_time(mem);
+        if (i<10) printf("hit time: %zu\n", d);
+        hit_histogram[MIN(sample_size - 1, d / 5)]++; // Bin the results
+    }
+
+    // 2. Measure cache miss latencies
+    for (int i = 0; i <4*1024*1024; i++) {
+        // *** MODIFICATION: Use inline assembly flush function ***
+        flush(mem);
+        _mm_mfence();
+        size_t d = measure_access_time(mem);
+                if (i<10) printf("miss time: %zu\n", d);
+        miss_histogram[MIN(sample_size - 1, d / 5)]++; // Bin the results
+    }
+
+    // 3. Find the peaks for hit and miss times
+    size_t hit_max = 0;
+    size_t hit_max_i = 0;
+    size_t miss_min_i = 0;
+
+    for (int i = 0; i < sample_size; i++) {
+        if (hit_max < hit_histogram[i]) {
+            hit_max = hit_histogram[i];
+            hit_max_i = i;
+        }
+        if (miss_histogram[i] > 10 && miss_min_i == 0) { // Find first significant miss bin
+            miss_min_i = i;
+        }
+    }
+
+    // 4. Find the "valley" between the two peaks
+    size_t min_overlap = -1UL;
+    size_t min_overlap_i = 0;
+
+    // Search for the minimum overlap point between the hit peak and miss start
+    for (size_t i = hit_max_i; i < miss_min_i; i++) {
+        if (min_overlap > (hit_histogram[i] + miss_histogram[i])) {
+            min_overlap = hit_histogram[i] + miss_histogram[i];
+            min_overlap_i = i;
+        }
+    }
+    printf("[Calibrating] Hit peak at ~%lu cycles, Miss peak starts at ~%lu cycles.\n", hit_max_i * 5, miss_min_i * 5);
+    // Sanity check
+    if (miss_min_i <= hit_max_i || min_overlap_i == 0) {
+        printf("[Warning] Calibration failed to find a clear threshold. Defaulting to 150.\n");
+        return 150;
+    }
+
+    unsigned int threshold = min_overlap_i * 5;
+    printf("[Calibrating] Hit peak at ~%lu cycles, Miss peak starts at ~%lu cycles.\n", hit_max_i * 5, miss_min_i * 5);
+    printf("[Calibrating] Determined Threshold: %u cycles.\n", threshold);
+
+    return threshold;
+}
+
+void* receiver_thread(void* arg) {
+    // Pin this thread to CPU 1
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("pthread_setaffinity_np receiver");
+    }
+    printf("[Receiver] Pinned to CPU 1.\n");
+
+    channel_t* channel = (channel_t*)arg;
+    char received_msg[MAX_MSG_SIZE] = {0};
+    int msg_index = 0;
+
+    // --- 1. Calibrate ---
+    channel->threshold = calibrate_threshold((void*)channel->shared_data);
+    if (channel->threshold == 0) {
+        fprintf(stderr, "Calibration failed. Exiting receiver.\n");
+        return NULL;
+    }
+
+    pthread_barrier_wait(&channel->barrier);
+
+    // --- 2. Synchronization Handshake ---
+    printf("[Receiver] Waiting for synchronization pattern (1010101011111111)...\n");
+    int sync_pattern = 0;
+
+    for (int b = 15; b >= 0; b--) {
+        // Signal ready for the next bit
+        channel->sync_flags[0] = 1;
+
+        // Wait for sender to send the bit
+        while(channel->sync_flags[1] == 0) { spin_wait(100); }
+        channel->sync_flags[1] = 0; // Clear the flag
+
+        // Read the bit
+        uint64_t time = measure_access_time((void*)channel->shared_data);
+        int bit = (time < channel->threshold) ? 1 : 0;
+        sync_pattern = ((sync_pattern << 1) | bit) & 0xFFFF;
+
+        printf("\r[Receiver Debug] Received bit: %d, Current Pattern: 0x%04X", bit, sync_pattern);
+        fflush(stdout);
+    }
+    printf("\n");
+
+    if (sync_pattern == 0xAAFF) {
+        channel->sync_flags[2] = 1; // Signal that sync was successful
+        printf("[Receiver] Sync pattern detected!\n");
+    } else {
+        printf("[Receiver] Sync pattern FAILED. Exiting.\n");
+        return NULL;
+    }
+
+    // --- 3. Receive Data ---
+    for (size_t i = 0; i < strlen(SECRET_MESSAGE); i++) {
+        char current_char = 0;
+        for (int j = 7; j >= 0; j--) {
+            while(channel->sync_flags[128] == 0) { spin_wait(100); }
+            channel->sync_flags[128] = 0;
+
+            uint64_t time = measure_access_time((void*)channel->shared_data);
+            int bit = (time < channel->threshold) ? 1 : 0;
+            current_char |= (bit << j);
+
+            channel->sync_flags[256] = 1;
+        }
+        received_msg[msg_index++] = current_char;
+        printf("\r[Receiver] Receiving... [ %s ]", received_msg);
+        fflush(stdout);
+    }
+
+    printf("\n[Receiver] Finished.\n");
+    printf("[Receiver] Full Message Received: \"%s\"\n", received_msg);
+
+    return NULL;
+}
+
+// --- Sender (Trojan) ---
+
+// Transmits a single bit (1 for access, 0 for flush).
+void transmit_bit(int bit, volatile char* addr) {
+    if (bit) {
+        maccess((void*)addr);
+    } else {
+        // *** MODIFICATION: Use inline assembly flush function ***
+        flush((void*)addr);
+    }
+    _mm_mfence();
+}
+
+void run_sender(void* arg) {
+    // Pin this thread (main) to CPU 0
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("pthread_setaffinity_np sender");
+    }
+    printf("[Sender] Pinned to CPU 0.\n");
+
+    channel_t* channel = (channel_t*)arg;
+    const char* message = SECRET_MESSAGE;
+
+    pthread_barrier_wait(&channel->barrier);
+
+    // --- 2. Synchronization Handshake ---
+    printf("[Sender] Sending synchronization pattern...\n");
+
+    for (int b = 15; b >= 0; b--) {
+        // Wait for the receiver to be ready for the next bit
+        while(channel->sync_flags[0] == 0) { spin_wait(100); }
+        channel->sync_flags[0] = 0; // Clear the flag
+
+        // Send the bit
+        int bit_to_send = (0xAAFF >> b) & 1;
+        transmit_bit(bit_to_send, channel->shared_data);
+
+        // Signal that the bit has been sent
+        channel->sync_flags[1] = 1;
+    }
+
+    // Wait for receiver to confirm the full pattern
+    while(channel->sync_flags[2] == 0) { spin_wait(100); }
+    printf("[Sender] Sync confirmed by receiver. Starting message transmission.\n");
+
+
+    // --- 3. Send Data ---
+    for (size_t i = 0; i < strlen(message); i++) {
+        char current_char = message[i];
+        for (int j = 7; j >= 0; j--) {
+            int bit = (current_char >> j) & 1;
+
+            channel->sync_flags[128] = 1;
+            transmit_bit(bit, channel->shared_data);
+
+            while(channel->sync_flags[256] == 0) { spin_wait(100); }
+            channel->sync_flags[256] = 0;
+        }
+    }
+
+    printf("[Sender] Finished sending message.\n");
+}
+
+// --- Main Thread ---
+int main() {
+    pthread_t receiver_tid;
+    channel_t channel;
+
+    // 1. Allocate memory
+    channel.shared_data = (volatile char*)malloc(SHARED_MEM_SIZE);
+    channel.sync_flags = (volatile char*)malloc(FLAG_MEM_SIZE);
+    if (!channel.shared_data || !channel.sync_flags) {
+        perror("malloc");
+        return 1;
+    }
+    memset((void*)channel.shared_data, 0, SHARED_MEM_SIZE);
+    memset((void*)channel.sync_flags, 0, FLAG_MEM_SIZE);
+
+    // 2. Initialize barrier for 2 threads
+    pthread_barrier_init(&channel.barrier, NULL, 2);
+
+    // 3. Create ONLY the receiver thread
+    printf("Creating receiver thread...\n");
+    if (pthread_create(&receiver_tid, NULL, receiver_thread, &channel) != 0) {
+        perror("pthread_create receiver");
+        return 1;
+    }
+
+    // Main thread BECOMES the sender
+    run_sender(&channel);
+
+    // 4. Wait for the receiver thread to finish
+    pthread_join(receiver_tid, NULL);
+
+    // 5. Clean up
+    pthread_barrier_destroy(&channel.barrier);
+    free((void*)channel.shared_data);
+    free((void*)channel.sync_flags);
+
+    printf("\nCovert channel simulation finished.\n");
+    return 0;
+}
+
+root@labpc:/AE-Folder/push-multicast/benchmarks/Rocket# b
+/AE-Folder/push-multicast/benchmarks
+root@labpc:/AE-Folder/push-multicast/benchmarks# cat M
+cat: M: No such file or directory
+root@labpc:/AE-Folder/push-multicast/benchmarks# cat Makefile
+BENCH_TOP=$(shell pwd)
+
+GEM_FORGE_BENCH=omp_conv3d2 omp_conv3d2_no_unroll omp_conv3d2_unroll \
+                                omp_conv3d2_unroll_xy \
+                                omp_dense_mv omp_dense_mv_blk omp_dense_mv_out \
+                                pathfinder_kernel
+
+BENCHDIR=${GEM_FORGE_TOP}/transform/benchmark/GemForgeMicroSuite
+LLVM_CFLAGS=-O3 -DGEM_FORGE -mavx512f -fopenmp -std=c11 -gline-tables-only
+
+LLVM_RELEASE=${GEM_FORGE_TOP}/llvm/install-release/bin
+LLVM_CC=${LLVM_RELEASE}/clang
+
+GEM_FORGE_TRANSFORM_SO=${GEM_FORGE_TOP}/transform/build/src/libLLVMTDGPass.so
+
+# We use debug version to enable the debug flags.
+LLVM_DEBUG=${GEM_FORGE_TOP}/llvm/install-debug/bin
+
+GF_GEM5_INC=${GEM_FORGE_TOP}/gem5/include
+GF_GEM5_OPS=${GEM_FORGE_TOP}/gem5/util/m5/m5op_x86.S
+
+GEM_FORGE_BIN_DIR=${BENCH_TOP}/bin/gem-forge
+
+GEM5_INC=${BENCH_TOP}/../gem5/include
+GEM5_OPS=${BENCH_TOP}/../gem5/util/m5/src/abi/x86/m5op.S
+
+CACHEBW_DIR=${BENCH_TOP}/ArchBenchSuite/level0/cachebw
+
+READBW_MULTILEVEL_DIR=${BENCH_TOP}/ArchBenchSuite/level0/readbw_multilevel
+
+
+.PHONY: all clean cachebw rodinia gem-forge parsec $(GEM_FORGE_BENCH) $(RODINIA_OMP_DIRS)
+
+all: cachebw readbw_multilevel mlp omp_conv3d2_unroll_xy.exe omp_dense_mv_blk_256kB.exe omp_dense_mv_blk_512kB.exe omp_dense_mv_blk_1024kB.exe rodinia parsec
+
+mlp:
+        mkdir -p ${BENCH_TOP}/bin
+        $(MAKE) SSE=3 -C libxsmm
+        gcc -DNDEBUG -DLIBXSMM_TARGET_ARCH=1006 -DLIBXSMM_OPENMP_SIMD -I./libxsmm/samples/deeplearning/mlpdriver -I./libxsmm/include -fPIC --static -g -Wall -O2 -fopenmp -fopenmp-simd -funroll-loops -ftree-vectorize -fdata-sections -ffunction-sections -fvisibility=hidden -pthread -msse3 -DGEM5 -I${GEM5_INC} -c libxsmm/samples/deeplearning/mlpdriver/mlp_example_f32.c -o mlp.o
+        gcc -static -o ${BENCH_TOP}/bin/mlp.exe mlp.o ${GEM5_OPS} -I${GEM5_INC} -L${BENCH_TOP}/libxsmm/lib/ -Wl,--as-needed ${BENCH_TOP}/libxsmm/lib/libxsmmext.a -Wl,--no-as-needed  ${BENCH_TOP}/libxsmm/lib/libxsmm.a -Wl,--as-needed ${BENCH_TOP}/libxsmm/lib/libxsmmnoblas.a -Wl,--no-as-needed -Wl,--gc-sections -Wl,-z,relro,-z,now -Wl,--as-needed -lm -lrt -ldl -L/usr/lib/gcc/x86_64-linux-gnu/10/libgfortran.a -lquadmath -lm -Wl,--no-as-needed -fopenmp -Wl,--as-needed -lstdc++ -Wl,--no-as-needed -pthread
+        rm mlp.o
+
+cachebw:
+        mkdir -p ${BENCH_TOP}/bin
+        # gcc -g -O2 -fopenmp -fstrict-aliasing -static -mavx2 -DGEM5 ${CACHEBW_DIR}/../common/perf_counter_markers.c ${CACHEBW_DIR}/cachebw.c -o cachebw.exe
+        gcc -g -O2 -fopenmp -fstrict-aliasing -static -mavx2 -DGEM5 -I${GEM5_INC} ${GEM5_OPS} ${CACHEBW_DIR}/../common/perf_counter_markers.c ${CACHEBW_DIR}/cachebw.c -o cachebw.exe
+        mv cachebw.exe ${BENCH_TOP}/bin/
+
+pure-cachebw:
+        mkdir -p ${BENCH_TOP}/bin
+        gcc -O2 -fopenmp -fstrict-aliasing -static -mavx2 ${CACHEBW_DIR}/../common/counters.c ${CACHEBW_DIR}/cachebw.c -o cachebw.exe
+        mv cachebw.exe ${BENCH_TOP}/bin/pure-cachebw.exe
+
+readbw_multilevel:
+        mkdir -p ${BENCH_TOP}/bin
+        gcc -g -O2 -fopenmp -static -g -mavx2 -fstrict-aliasing -DGEM5 -I${GEM5_INC} ${GEM5_OPS} ${READBW_MULTILEVEL_DIR}/readbw_multilevel.c ${READBW_MULTILEVEL_DIR}/../common/perf_counter_markers.c -o readbw_multilevel.exe
+        mv readbw_multilevel.exe ${BENCH_TOP}/bin/
+
+gem-forge: ${GEM_FORGE_BIN_DIR} $(GEM_FORGE_BENCH)
+
+${GEM_FORGE_BIN_DIR}:
+        mkdir -p $@
+
+$(GEM_FORGE_BENCH):
+        ${LLVM_CC} -static -o ${GEM_FORGE_BIN_DIR}/$@.exe ${BENCHDIR}/$@/$@.c ${LLVM_CFLAGS} -lomp -lpthread -Wl,--no-as-needed -ffp-contract=off -ldl -I${GF_GEM5_INC} ${GF_GEM5_OPS}
+
+omp_conv3d2_unroll_xy.exe: ${BENCHDIR}/omp_conv3d2_unroll_xy/omp_conv3d2_unroll_xy.c
+        mkdir -p ${GEM_FORGE_BIN_DIR}
+        ${LLVM_CC} -g -static -o $@ $^ ${LLVM_CFLAGS} -lomp -lpthread -Wl,--no-as-needed -ffp-contract=off -ldl -I${GF_GEM5_INC} ${GF_GEM5_OPS}
+        mv omp_conv3d2_unroll_xy.exe ${GEM_FORGE_BIN_DIR}
+
+clean_omp_conv3d2_unroll_xy:
+        rm ${GEM_FORGE_BIN_DIR}/omp_conv3d2_unroll_xy.exe
+
+omp_dense_mv_blk_256kB.exe: ${BENCHDIR}/omp_dense_mv_blk/omp_dense_mv_blk.c
+        mkdir -p ${GEM_FORGE_BIN_DIR}
+        ${LLVM_CC} -static -o $@ $^ ${LLVM_CFLAGS} -DL2Cache_256kB -lomp -lpthread -Wl,--no-as-needed -ffp-contract=off -ldl -I${GF_GEM5_INC} ${GF_GEM5_OPS}
+        mv omp_dense_mv_blk_256kB.exe ${GEM_FORGE_BIN_DIR}
+
+omp_dense_mv_blk_512kB.exe: ${BENCHDIR}/omp_dense_mv_blk/omp_dense_mv_blk.c
+        mkdir -p ${GEM_FORGE_BIN_DIR}
+        ${LLVM_CC} -static -o $@ $^ ${LLVM_CFLAGS} -DL2Cache_512kB -lomp -lpthread -Wl,--no-as-needed -ffp-contract=off -ldl -I${GF_GEM5_INC} ${GF_GEM5_OPS}
+        mv omp_dense_mv_blk_512kB.exe ${GEM_FORGE_BIN_DIR}
+
+omp_dense_mv_blk_1024kB.exe: ${BENCHDIR}/omp_dense_mv_blk/omp_dense_mv_blk.c
+        mkdir -p ${GEM_FORGE_BIN_DIR}
+        ${LLVM_CC} -static -o $@ $^ ${LLVM_CFLAGS} -DL2Cache_1024kB -lomp -lpthread -Wl,--no-as-needed -ffp-contract=off -ldl -I${GF_GEM5_INC} ${GF_GEM5_OPS}
+        mv omp_dense_mv_blk_1024kB.exe ${GEM_FORGE_BIN_DIR}
+
+pathfinder.exe: ${BENCHDIR}/pathfinder_kernel/pathfinder_kernel.c
+        mkdir -p ${GEM_FORGE_BIN_DIR}
+        ${LLVM_CC} -static -o $@ $^ ${LLVM_CFLAGS} -lomp -lpthread -Wl,--no-as-needed -ffp-contract=off -ldl -I${GF_GEM5_INC} ${GF_GEM5_OPS}
+        mv pathfinder.exe ${GEM_FORGE_BIN_DIR}
+
+clean_pathfinder:
+        rm ${GEM_FORGE_BIN_DIR}/pathfinder.exe
+
+clean-gem-forge:
+        rm -rf ${GEM_FORGE_BIN_DIR}
+
+
+RODINIA_BASE_DIR=$(BENCH_TOP)/rodinia
+
+RODINIA_BIN_DIR=$(BENCH_TOP)/bin/rodinia
+
+#RODINIA_OMP_DIRS := b+tree backprop bfs cfd heartwall hotspot kmeans lavaMD leukocyte lud nn nw srad streamcluster particlefilter pathfinder mummergpu
+RODINIA_OMP_DIRS := backprop bfs lud particlefilter pathfinder-avx512
+
+rodinia:
+        mkdir -p $(RODINIA_BIN_DIR)
+        cd $(RODINIA_BASE_DIR)/openmp/backprop;             $(MAKE) -f Makefile.gem5; cp backprop.exe $(RODINIA_BIN_DIR)
+        cd $(RODINIA_BASE_DIR)/openmp/bfs;                  $(MAKE) -f Makefile.gem5; cp bfs.exe $(RODINIA_BIN_DIR)
+        cd $(RODINIA_BASE_DIR)/openmp/lud;                  $(MAKE) -f Makefile.gem5; cp lud.exe $(RODINIA_BIN_DIR)
+        cd $(RODINIA_BASE_DIR)/openmp/particlefilter;       $(MAKE) -f Makefile.gem5; cp particlefilter.exe $(RODINIA_BIN_DIR)
+        cd $(RODINIA_BASE_DIR)/openmp/pathfinder-avx512;    $(MAKE) -f Makefile.gem5; cp pathfinder.exe $(RODINIA_BIN_DIR)
+
+
+PARSECDIR=$(BENCH_TOP)/parsec-3.0
+PARSEC_BIN_DIR=$(BENCH_TOP)/bin/parsec
+PARSEC_APPS=blackscholes bodytrack fluidanimate freqmine swaptions
+PARSEC_KERNELS=`ls $(PARSECDIR)/pkgs/kernels`
+
+parsec:
+        mkdir -p $(PARSEC_BIN_DIR)
+        cd $(PARSECDIR); ./bin/parsecmgmt -a build -p parsecapps -c gcc-gem5hooks
+        for bench in $(PARSEC_APPS); do mkdir $(PARSEC_BIN_DIR)/$$bench; cp $(PARSECDIR)/pkgs/apps/$$bench/inst/*.gcc-gem5hooks/* -rf $(PARSEC_BIN_DIR)/$$bench/; done
+
+# for timing channel attack by Rocket
+CUSTOM_BIN_DIR=$(BENCH_TOP)/bin/Rocket
+GEM5_GCC = /usr/bin/gcc
+GEM5_CFLAGS = -O2 -static -pthread
+
+attack:
+        mkdir -p $(CUSTOM_BIN_DIR)
+        $(GEM5_GCC) $(GEM5_CFLAGS) -o $(CUSTOM_BIN_DIR)/attack.exe $(BENCH_TOP)/Rocket/covert_channel.c
+
+clean-attack:
+        rm -rf $(CUSTOM_BIN_DIR)
+
+clean-rodinia:
+        rm -rf $(RODINIA_BIN_DIR)
+        for dir in $(RODINIA_OMP_DIRS) ; do cd $(RODINIA_BASE_DIR)/openmp/$$dir; $(MAKE) clean -f Makefile.gem5; cd ../.. ; done
+
+clean-cachebw:
+        rm -f ${BENCH_TOP}/bin/cachebw.exe
+
+clean-mlp:
+        rm -f ${BENCH_TOP}/bin/mlp.exe
+
+clean-parsec:
+        rm -f $(PARSEC_BIN_DIR)
+
+clean:
+        rm -rf ${BENCH_TOP}/bin
+root@labpc:/AE-Folder/push-multicast/benchmarks# b
+/AE-Folder/push-multicast
+root@labpc:/AE-Folder/push-multicast# cd utils/
+root@labpc:/AE-Folder/push-multicast/utils# cat run-experiment.py
 import os
 import sys
 import math
@@ -482,6 +964,13 @@ def get_benchmark_cmd_options(args):
                     f"--analyse b8x8,i4x4 --threads {num_cpus} -o " + \
                     f"{parsec_run_dir}/x264/{scheme}_medium_eledream.264 " + \
                     f"{parsec_input_dir}/x264/eledream_640x360_8.y4m"
+
+
+    elif benchmark == "covertchannel":
+        # You may use any directory, adjust according to your artifact structure
+        cmd = "benchmarks/bin/Rocket/attack.exe"
+        options = ""  # no extra options needed, or set up as per your experiment
+
 
     else:
         # TODO: add other benchmarks
@@ -1211,7 +1700,7 @@ def main():
                                  "blackscholes", "bodytrack", "canneal",
                                  "dedup", "facesim", "ferret", "fluidanimate",
                                  "freqmine", "raytrace", "streamcluster",
-                                 "swaptions", "vips", "x264"],
+                                 "swaptions", "vips", "x264","covertchannel"],
                         help="Benchmark to run [Default: cachebw]")
     parser.add_argument("--benchmarks", type=str, nargs='*',
                         default=["cachebw", "readbw_multilevel", "mlp", "conv3dfoowarm", "mv",
